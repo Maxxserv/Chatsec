@@ -71,7 +71,10 @@ needs_install() {
     # Re-install if stamp is missing, venv is gone, or cryptography is absent
     [ ! -f "$STAMP_FILE" ]    && return 0
     [ ! -x "$VENV_PYTHON" ]   && return 0
-    "$VENV_PYTHON" -c "import cryptography" 2>/dev/null || return 0
+    "$VENV_PYTHON" -c "import cryptography" 2>/dev/null || {
+    warn "cryptography missing — installing system package..."
+    pkg install python-cryptography -y
+}
     return 1
 }
 
