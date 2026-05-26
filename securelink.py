@@ -86,18 +86,31 @@ def save_peer(alias, fingerprint, pubkey_hex):
 
 # ─── CRYPTO ENGINE ────────────────────────────────────────────────────────────
 class CryptoSession:
-    """X25519 ECDH + HKDF → AES-256-GCM per-message with nonce rotation"""
+    """X25519 ECDH + HKDF → AES-256-GCM per-message with nonce rotation.
 
-    def __init__(self, private_key: X25519PrivateKey, peer_pub_raw: bytes):
+    Key assignment is direction-aware so that:
+      initiator send_key  == responder recv_key  (material[:32])
+      initiator recv_key  == responder send_key  (material[32:])
+    Both sides derive identical material from the shared secret; the 'initiator'
+    flag just controls which half is used for which direction.
+    """
+
+    def __init__(self, private_key: X25519PrivateKey, peer_pub_raw: bytes,
+                 initiator: bool):
         shared = private_key.exchange(_load_x25519_pub(peer_pub_raw))
-        # Derive two 32-byte keys: one for send, one for receive
         material = HKDF(
             algorithm=hashes.SHA256(), length=64,
             salt=None, info=b"securelink-v1",
             backend=default_backend()
         ).derive(shared)
-        self.send_key = AESGCM(material[:32])
-        self.recv_key = AESGCM(material[32:])
+        # Initiator uses material[:32] to send, material[32:] to recv.
+        # Responder is the mirror image — so each side decrypts what the other encrypts.
+        if initiator:
+            self.send_key = AESGCM(material[:32])
+            self.recv_key = AESGCM(material[32:])
+        else:
+            self.send_key = AESGCM(material[32:])
+            self.recv_key = AESGCM(material[:32])
         self._send_ctr = 0
         self._lock = threading.Lock()
 
@@ -204,11 +217,15 @@ def print_help():
 """)
 
 # ─── HANDSHAKE ────────────────────────────────────────────────────────────────
-def do_handshake(sock: socket.socket, my_priv, my_pub_raw, my_fp, psk: bytes = None):
+def do_handshake(sock: socket.socket, my_priv, my_pub_raw, my_fp,
+                 psk: bytes = None, initiator: bool = True):
     """
     1. Exchange raw X25519 public keys
     2. Optionally verify PSK (pre-shared secret for mutual auth)
-    3. Return CryptoSession + peer fingerprint
+    3. Return SecureChannel + peer fingerprint
+
+    initiator=True  → client (connects first, sends pubkey first)
+    initiator=False → server (accepts connection, receives pubkey first)
     """
     # Send our pubkey
     send_frame(sock, MT_HANDSHAKE, my_pub_raw)
@@ -218,16 +235,14 @@ def do_handshake(sock: socket.socket, my_priv, my_pub_raw, my_fp, psk: bytes = N
         raise ValueError("Invalid peer public key length")
     peer_fp = hashlib.sha256(peer_pub_raw).hexdigest()[:16]
 
-    # Build crypto session
-    crypto = CryptoSession(my_priv, peer_pub_raw)
+    # Build crypto session — direction-aware
+    crypto = CryptoSession(my_priv, peer_pub_raw, initiator=initiator)
     chan = SecureChannel(sock, crypto)
 
     # PSK-based mutual authentication (HMAC challenge-response)
     if psk:
-        # Send challenge
         my_challenge = os.urandom(32)
         chan.send(MT_AUTH, my_challenge)
-        # Receive peer's challenge + their response to ours
         _, peer_data = chan.recv()
         peer_challenge = peer_data[:32]
         peer_response  = peer_data[32:]
@@ -235,11 +250,10 @@ def do_handshake(sock: socket.socket, my_priv, my_pub_raw, my_fp, psk: bytes = N
         if not hmac_compare(peer_response, expected):
             chan.close()
             raise PermissionError("PSK authentication FAILED — untrusted peer")
-        # Send our response to peer's challenge
         my_response = hashlib.sha256(psk + peer_challenge).digest()
         chan.send(MT_AUTH_OK, my_response)
     else:
-        # No PSK: still do a basic liveness check
+        # No PSK: basic liveness check
         chan.send(MT_PING, b'securelink-hello')
         _, pong = chan.recv()
         if pong != b'securelink-hello':
@@ -261,7 +275,6 @@ def send_file(chan: SecureChannel, filepath: str):
         return
     size = path.stat().st_size
     name = path.name
-    # Header: filename_len(2) + filename + filesize(8)
     fname_b = name.encode()
     header = struct.pack(">H", len(fname_b)) + fname_b + struct.pack(">Q", size)
     chan.send(MT_FILE, header)
@@ -277,7 +290,6 @@ def send_file(chan: SecureChannel, filepath: str):
             pct = sent / size * 100 if size else 100
             bar = _progress_bar(pct)
             print(f"\r  {bar} {pct:.1f}% ({_fmt_size(sent)}/{_fmt_size(size)})", end='', flush=True)
-    # EOF marker
     chan.send(MT_FILE, b'__EOF__')
     elapsed = time.time() - t0
     speed = size / elapsed if elapsed > 0 else 0
@@ -338,7 +350,6 @@ def interactive_shell_session(chan: SecureChannel):
             break
         if not cmd: continue
         chan.send(MT_SHELL, cmd.encode())
-        # Response arrives via main recv loop; we block-wait here
         try:
             t, data = chan.recv()
             if t == MT_SHELL_D:
@@ -432,12 +443,10 @@ def chat_loop(chan: SecureChannel, peer_fp: str, download_dir: Path):
                 path = line[6:].strip()
                 threading.Thread(target=send_file, args=(chan, path), daemon=True).start()
             elif line == '/shell':
-                # Interactive shell mode — blocks until 'exit'
                 interactive_shell_session(chan)
             elif line.startswith('/shell '):
                 cmd = line[7:].strip()
                 chan.send(MT_SHELL, cmd.encode())
-                # Wait up to 10s for response
                 waited = 0
                 while waited < 100 and not shell_queue:
                     time.sleep(0.1)
@@ -468,7 +477,8 @@ def run_server(host: str, port: int, psk: bytes, my_priv, my_pub, my_fp, downloa
     sock.close()
     conn.settimeout(30)
     print(f"  {YELLOW}⚡ Incoming from {addr[0]}:{addr[1]} — performing handshake…{R}")
-    chan, peer_fp = do_handshake(conn, my_priv, my_pub, my_fp, psk)
+    # Server is the responder (initiator=False)
+    chan, peer_fp = do_handshake(conn, my_priv, my_pub, my_fp, psk, initiator=False)
     conn.settimeout(None)
     print_banner(my_fp, "server", peer_fp)
     chat_loop(chan, peer_fp, download_dir)
@@ -486,7 +496,8 @@ def run_client(host: str, port: int, psk: bytes, my_priv, my_pub, my_fp, downloa
             sock.settimeout(30)
             print(f"  {GREEN}connected{R}")
             print(f"  {YELLOW}⚡ Performing encrypted handshake…{R}")
-            chan, peer_fp = do_handshake(sock, my_priv, my_pub, my_fp, psk)
+            # Client is the initiator (initiator=True)
+            chan, peer_fp = do_handshake(sock, my_priv, my_pub, my_fp, psk, initiator=True)
             sock.settimeout(None)
             print_banner(my_fp, "client", peer_fp)
             chat_loop(chan, peer_fp, download_dir)
