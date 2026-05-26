@@ -69,12 +69,12 @@ STAMP_FILE="$HOME/.securelink/.installed"   # written after successful install
 # ─────────────────────────────────────────────────────────────────────────────
 needs_install() {
     # Re-install if stamp is missing, venv is gone, or cryptography is absent
-    [ ! -f "$STAMP_FILE" ]    && return 0
-    [ ! -x "$VENV_PYTHON" ]   && return 0
+    [ ! -f "$STAMP_FILE" ]  && return 0
+    [ ! -x "$VENV_PYTHON" ] && return 0
     "$VENV_PYTHON" -c "import cryptography" 2>/dev/null || {
-    warn "cryptography missing — installing system package..."
-    pkg install python-cryptography -y
-}
+        warn "cryptography missing — installing via pip..."
+        "$VENV_PYTHON" -m pip install cryptography
+    }
     return 1
 }
 
@@ -153,8 +153,7 @@ fi
 # Step 4 — Launch
 # ─────────────────────────────────────────────────────────────────────────────
 step "Launching SecureLink…"
-echo -e "  ${DIM}Command: $VENV_PYTHON $SECURELINK_PY ${FORWARD_ARGS[*]:-}{R}"
+echo -e "  ${DIM}Command: $VENV_PYTHON $SECURELINK_PY ${FORWARD_ARGS[*]:-}${R}"
 echo ""
 
 exec "$VENV_PYTHON" "$SECURELINK_PY" "${FORWARD_ARGS[@]}"
-
