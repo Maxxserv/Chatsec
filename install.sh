@@ -33,7 +33,7 @@ info "Detected environment: ${ENV}"
 # ── Private venv location ─────────────────────────────────────────────────────
 VENV_DIR="$HOME/.securelink/venv"
 
-# ── Install Python, pipx, and WireGuard tools ─────────────────────────────────
+# ── Install Python and WireGuard tools ────────────────────────────────────────
 case $ENV in
     termux)
         info "Updating Termux packages…"
@@ -42,10 +42,9 @@ case $ENV in
         info "Installing Python…"
         pkg install -y python 2>/dev/null || true
 
-        info "Installing pipx…"
-        pip install pipx --quiet
-        export PATH="$HOME/.local/bin:$PATH"
-        python -m pipx ensurepath --force 2>/dev/null || true
+        info "Installing python-cryptography (pre-built Termux package)…"
+        pkg install -y python-cryptography 2>/dev/null \
+            || error "Failed to install python-cryptography. Run 'pkg install python-cryptography' manually."
 
         info "Installing wireguard-tools…"
         pkg install -y wireguard-tools 2>/dev/null \
@@ -60,19 +59,8 @@ case $ENV in
         info "Updating apt…"
         sudo apt-get update -qq
 
-        info "Installing Python3, pip, venv, and pipx…"
-        sudo apt-get install -y python3 python3-pip python3-venv python3-pipx curl 2>/dev/null \
-            || sudo apt-get install -y python3 python3-pip python3-venv curl 2>/dev/null
-
-        # Fall back to pip-installed pipx if the apt package isn't available
-        if ! command -v pipx &>/dev/null; then
-            info "apt pipx not found — installing via pip…"
-            pip3 install pipx --quiet --break-system-packages 2>/dev/null \
-                || pip3 install pipx --quiet
-        fi
-
-        python3 -m pipx ensurepath --force 2>/dev/null || true
-        export PATH="$HOME/.local/bin:$PATH"
+        info "Installing Python3, pip, and venv…"
+        sudo apt-get install -y python3 python3-pip python3-venv curl 2>/dev/null
 
         INSTALL_DIR="/usr/local/bin"
         PYTHON_CMD="python3"
@@ -82,28 +70,14 @@ case $ENV in
         info "Generic Linux — checking for pip3…"
         command -v pip3 &>/dev/null || error "pip3 not found. Install python3-pip manually."
 
-        info "Installing pipx…"
-        pip3 install pipx --quiet \
-            || error "pipx install failed. Install pipx manually and re-run."
-        python3 -m pipx ensurepath --force 2>/dev/null || true
-        export PATH="$HOME/.local/bin:$PATH"
-
         INSTALL_DIR="$HOME/.local/bin"
         PYTHON_CMD="python3"
         ;;
 esac
 
-# Confirm pipx is reachable
-command -v pipx &>/dev/null || error "pipx is not on PATH after install. Open a new shell and re-run."
-
-# ── Create SecureLink's private virtual environment via pipx ──────────────────
+# ── Create SecureLink's private virtual environment ───────────────────────────
 info "Creating private SecureLink environment at ${VENV_DIR}…"
 mkdir -p "$(dirname "$VENV_DIR")"
-
-# pipx uses venv under the hood; we create the venv ourselves so we can point
-# the securelink shebang at it, then inject the dependency via pipx inject-style
-# (pipx inject requires an already-installed app, so we use the venv's own pip —
-# the venv is still fully isolated from the system and owned by SecureLink only).
 $PYTHON_CMD -m venv "$VENV_DIR"
 
 VENV_PYTHON="$VENV_DIR/bin/python"
@@ -112,11 +86,26 @@ VENV_PIP="$VENV_DIR/bin/pip"
 info "Upgrading pip inside the private environment…"
 "$VENV_PIP" install --upgrade pip --quiet
 
-info "Installing cryptography into the private environment via pipx-managed pip…"
-# pipx inject works against a named pipx app; for a script-based install we use
-# the venv pip directly — this keeps the dependency fully isolated (no
-# --break-system-packages, no system-wide writes).
-"$VENV_PIP" install cryptography --quiet
+# ── Install cryptography ──────────────────────────────────────────────────────
+if [ "$ENV" = "termux" ]; then
+    # On Termux, cryptography is already installed system-wide via pkg above.
+    # Make it visible inside the venv by symlinking the site-packages.
+    info "Linking system cryptography into the private environment…"
+    SYSTEM_SITE="$(python -c 'import site; print(site.getsitepackages()[0])')"
+    VENV_SITE="$("$VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
+    # Enable system site-packages access in the venv
+    "$VENV_PYTHON" -m pip install --quiet cryptography \
+        --find-links "$SYSTEM_SITE" --no-index 2>/dev/null \
+        || {
+            # Fallback: recreate venv with system site-packages access
+            warn "Direct link failed — recreating venv with --system-site-packages…"
+            rm -rf "$VENV_DIR"
+            $PYTHON_CMD -m venv "$VENV_DIR" --system-site-packages
+        }
+else
+    info "Installing cryptography into the private environment…"
+    "$VENV_PIP" install cryptography --quiet
+fi
 
 info "Cryptography installed: $("$VENV_PYTHON" -c 'import cryptography; print(cryptography.__version__)')"
 
@@ -171,4 +160,3 @@ echo ""
 echo -e "  ${DIM}Keys stored at:    ~/.securelink/identity.key${R}"
 echo -e "  ${DIM}Private venv at:   ${VENV_DIR}${R}"
 echo ""
-
